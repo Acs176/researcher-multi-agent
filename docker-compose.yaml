@@ -1,0 +1,33 @@
+services:
+  otel-collector:
+    container_name: otel
+    platform: linux/amd64
+    image: otel/opentelemetry-collector:latest
+    ports:
+      - "4317:4317" ## grpc ingest
+    volumes:
+      - ./observability/otel-collector.yaml:/config/otel-collector.yaml
+    command:
+      - --config=/config/otel-collector.yaml
+
+  jaeger:
+    container_name: jaeger
+    image: jaegertracing/all-in-one:latest
+    environment:
+      - COLLECTOR_OTLP_ENABLED=true
+    ports:
+      - "16686:16686" ## Jaeger UI
+
+  grafana:
+    container_name: grafana
+    image: grafana/grafana:latest
+    volumes:
+      - grafana-data:/var/lib/grafana
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+    ports:
+      - "3000:3000"
+
+volumes:
+  grafana-data:

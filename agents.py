@@ -41,6 +41,7 @@ class BaseAgent:
         self.logger.info("%s output=%s", label, preview)
 
 
+
 class PlannerAgent(BaseAgent):
     def register(self) -> None:
         self.bus.subscribe("user_query", self.handle)

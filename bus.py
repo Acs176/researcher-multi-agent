@@ -7,7 +7,6 @@ from dataclasses import dataclass, field
 import logging
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 
-
 @dataclass
 class Message:
     id: str
