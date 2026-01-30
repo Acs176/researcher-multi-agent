@@ -4,6 +4,8 @@ import asyncio
 import logging
 from typing import Optional
 
+from opentelemetry import trace
+
 from agents import CriticAgent, PlannerAgent, SearchAgent, SummarizerAgent, WriterAgent
 from bus import Message, MessageBus
 from search_providers import SearchProvider
@@ -48,5 +50,9 @@ class ResearchCoordinator:
         loop = asyncio.get_running_loop()
         self._final_future = loop.create_future()
         msg = self.bus.new_message("User", "user_query", query)
-        await self.bus.publish(msg)
-        return await asyncio.wait_for(self._final_future, timeout=timeout)
+        tracer = trace.get_tracer(__name__)
+        with tracer.start_as_current_span("research.run") as span:
+            span.set_attribute("app.query", query)
+            span.set_attribute("app.timeout.seconds", timeout)
+            await self.bus.publish(msg)
+            return await asyncio.wait_for(self._final_future, timeout=timeout)

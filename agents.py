@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import contextlib
 import logging
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterator, List, Optional
+
+from opentelemetry import trace
 
 from bus import Message, MessageBus
 from prompts import CRITIC_SYSTEM, PLANNER_SYSTEM, SUMMARIZER_SYSTEM, WRITER_SYSTEM
@@ -16,6 +19,25 @@ class BaseAgent:
         self.bus = bus
         self.llm = llm
         self.logger = logging.getLogger(f"agent.{name.lower()}")
+
+    @contextlib.contextmanager
+    def _span(
+        self,
+        name: str,
+        message: Message,
+        attrs: Optional[Dict[str, Any]] = None,
+    ) -> Iterator[None]:
+        tracer = trace.get_tracer(__name__)
+        with tracer.start_as_current_span(name) as span:
+            span.set_attribute("agent.name", self.name)
+            span.set_attribute("message.type", message.type)
+            span.set_attribute("message.sender", message.sender)
+            span.set_attribute("message.id", message.id)
+            if attrs:
+                for key, value in attrs.items():
+                    if value is not None:
+                        span.set_attribute(key, value)
+            yield
 
     async def send(
         self,
@@ -48,35 +70,40 @@ class PlannerAgent(BaseAgent):
 
     async def handle(self, message: Message) -> None:
         self.logger.info("recv type=%s from=%s", message.type, message.sender)
-        result = await self.llm.complete(
-            PLANNER_SYSTEM,
-            message.content,
-            response_format={"type": "json_object"},
-        )
-        self._log_llm_output("planner", result)
-        try:
-            plan_json = require_json(result)
-        except ValueError:
-            self.logger.error("planner invalid json: %s", _truncate(result, 1000))
-            raise
-        plan_json = _normalize_plan(plan_json)
-        if plan_json.get("needs_clarification"):
-            clarification = plan_json.get("clarification") or {}
-            question = clarification.get("question") or "Could you clarify your request?"
+        with self._span(
+            "agent.planner.handle",
+            message,
+            {"message.content_length": len(message.content)},
+        ):
+            result = await self.llm.complete(
+                PLANNER_SYSTEM,
+                message.content,
+                response_format={"type": "json_object"},
+            )
+            self._log_llm_output("planner", result)
+            try:
+                plan_json = require_json(result)
+            except ValueError:
+                self.logger.error("planner invalid json: %s", _truncate(result, 1000))
+                raise
+            plan_json = _normalize_plan(plan_json)
+            if plan_json.get("needs_clarification"):
+                clarification = plan_json.get("clarification") or {}
+                question = clarification.get("question") or "Could you clarify your request?"
+                await self.send(
+                    "clarification_request",
+                    question,
+                    metadata=plan_json,
+                    in_reply_to=message.id,
+                )
+                return
+            payload = f"{result}\n\nJSON:\n{to_json_text(plan_json)}"
             await self.send(
-                "clarification_request",
-                question,
-                metadata=plan_json,
+                "plan",
+                payload,
+                metadata={"plan": plan_json, "user_query": message.content},
                 in_reply_to=message.id,
             )
-            return
-        payload = f"{result}\n\nJSON:\n{to_json_text(plan_json)}"
-        await self.send(
-            "plan",
-            payload,
-            metadata={"plan": plan_json, "user_query": message.content},
-            in_reply_to=message.id,
-        )
 
 
 class SearchAgent(BaseAgent):
@@ -91,26 +118,28 @@ class SearchAgent(BaseAgent):
 
     async def handle_plan(self, message: Message) -> None:
         self.logger.info("recv plan from=%s", message.sender)
-        plan = (message.metadata or {}).get("plan", {})
-        if plan.get("needs_clarification"):
-            self.logger.info("skip search due to clarification request")
-            return
-        user_query = (message.metadata or {}).get("user_query", "")
-        queries = plan.get("search_queries") or [user_query or message.content]
-        await self._run_searches(queries, in_reply_to=message.id, user_query=user_query)
+        with self._span("agent.search.handle_plan", message):
+            plan = (message.metadata or {}).get("plan", {})
+            if plan.get("needs_clarification"):
+                self.logger.info("skip search due to clarification request")
+                return
+            user_query = (message.metadata or {}).get("user_query", "")
+            queries = plan.get("search_queries") or [user_query or message.content]
+            await self._run_searches(queries, in_reply_to=message.id, user_query=user_query)
 
     async def handle_request(self, message: Message) -> None:
         self.logger.info("recv info_request from=%s", message.sender)
-        req = extract_json(message.content) or {}
-        intent = (req.get("intent") or "").lower()
-        if intent != "search":
-            self.logger.info("ignore info_request intent=%s", intent or "none")
-            return
-        query = req.get("query")
-        if not query:
-            self.logger.info("ignore info_request with empty query")
-            return
-        await self._run_searches([query], in_reply_to=message.id, user_query="")
+        with self._span("agent.search.handle_request", message):
+            req = extract_json(message.content) or {}
+            intent = (req.get("intent") or "").lower()
+            if intent != "search":
+                self.logger.info("ignore info_request intent=%s", intent or "none")
+                return
+            query = req.get("query")
+            if not query:
+                self.logger.info("ignore info_request with empty query")
+                return
+            await self._run_searches([query], in_reply_to=message.id, user_query="")
 
     async def _run_searches(
         self,
@@ -118,25 +147,30 @@ class SearchAgent(BaseAgent):
         in_reply_to: Optional[str],
         user_query: str,
     ) -> None:
-        for query in queries:
-            if not query:
-                continue
-            if "{$input}" in query:
-                query = query.replace("{$input}", user_query or "").strip()
-            if not query:
-                self.logger.info("skip empty query after substitution")
-                continue
-            self.logger.info("search query=%s", query)
-            try:
-                results = await self.provider.search(query)
-            except Exception as exc:  # pragma: no cover - external dependency
-                self.logger.warning("search failed query=%s error=%s", query, exc, exc_info=True)
-                continue
-            self._results.extend(results)
-        self.logger.info("search results total=%s", len(self._results))
-        formatted = _format_results(self._results)
-        metadata = {"results": [r.__dict__ for r in self._results]}
-        await self.send("search_results", formatted, metadata=metadata, in_reply_to=in_reply_to)
+        tracer = trace.get_tracer(__name__)
+        with tracer.start_as_current_span("agent.search.run_searches") as span:
+            span.set_attribute("agent.name", self.name)
+            span.set_attribute("search.query_count", len([q for q in queries if q]))
+            for query in queries:
+                if not query:
+                    continue
+                if "{$input}" in query:
+                    query = query.replace("{$input}", user_query or "").strip()
+                if not query:
+                    self.logger.info("skip empty query after substitution")
+                    continue
+                self.logger.info("search query=%s", query)
+                try:
+                    results = await self.provider.search(query)
+                except Exception as exc:  # pragma: no cover - external dependency
+                    self.logger.warning("search failed query=%s error=%s", query, exc, exc_info=True)
+                    continue
+                self._results.extend(results)
+            span.set_attribute("search.results.total", len(self._results))
+            self.logger.info("search results total=%s", len(self._results))
+            formatted = _format_results(self._results)
+            metadata = {"results": [r.__dict__ for r in self._results]}
+            await self.send("search_results", formatted, metadata=metadata, in_reply_to=in_reply_to)
 
 
 class SummarizerAgent(BaseAgent):
@@ -146,20 +180,25 @@ class SummarizerAgent(BaseAgent):
     async def handle(self, message: Message) -> None:
         self.logger.info("recv search_results from=%s", message.sender)
         results = (message.metadata or {}).get("results", [])
-        user_prompt = _results_to_prompt(results)
-        result = await self.llm.complete(
-            SUMMARIZER_SYSTEM,
-            user_prompt,
-            response_format={"type": "json_object"},
-        )
-        self._log_llm_output("summarizer", result)
-        try:
-            summary_json = require_json(result)
-        except ValueError:
-            self.logger.error("summarizer invalid json: %s", _truncate(result, 1000))
-            raise
-        payload = to_json_text(summary_json)
-        await self.send("summary", payload, metadata=summary_json, in_reply_to=message.id)
+        with self._span(
+            "agent.summarizer.handle",
+            message,
+            {"search.results.count": len(results)},
+        ):
+            user_prompt = _results_to_prompt(results)
+            result = await self.llm.complete(
+                SUMMARIZER_SYSTEM,
+                user_prompt,
+                response_format={"type": "json_object"},
+            )
+            self._log_llm_output("summarizer", result)
+            try:
+                summary_json = require_json(result)
+            except ValueError:
+                self.logger.error("summarizer invalid json: %s", _truncate(result, 1000))
+                raise
+            payload = to_json_text(summary_json)
+            await self.send("summary", payload, metadata=summary_json, in_reply_to=message.id)
 
 
 class CriticAgent(BaseAgent):
@@ -173,30 +212,35 @@ class CriticAgent(BaseAgent):
 
     async def handle(self, message: Message) -> None:
         self.logger.info("recv summary from=%s", message.sender)
-        if self._rounds >= self.max_rounds:
-            await self.send(
-                "critique",
-                to_json_text({"status": "ok", "issues": [], "requests": []}),
-                metadata={"status": "ok"},
-                in_reply_to=message.id,
+        with self._span(
+            "agent.critic.handle",
+            message,
+            {"critic.round": self._rounds, "critic.max_rounds": self.max_rounds},
+        ):
+            if self._rounds >= self.max_rounds:
+                await self.send(
+                    "critique",
+                    to_json_text({"status": "ok", "issues": [], "requests": []}),
+                    metadata={"status": "ok"},
+                    in_reply_to=message.id,
+                )
+                return
+            result = await self.llm.complete(
+                CRITIC_SYSTEM,
+                message.content,
+                response_format={"type": "json_object"},
             )
-            return
-        result = await self.llm.complete(
-            CRITIC_SYSTEM,
-            message.content,
-            response_format={"type": "json_object"},
-        )
-        self._log_llm_output("critic", result)
-        try:
-            critique = require_json(result)
-        except ValueError:
-            self.logger.error("critic invalid json: %s", _truncate(result, 1000))
-            raise
-        self._rounds += 1
-        await self.send("critique", to_json_text(critique), metadata=critique, in_reply_to=message.id)
-        if critique.get("status") == "needs_more":
-            for req in critique.get("requests", []):
-                await self.send("info_request", to_json_text(req), in_reply_to=message.id)
+            self._log_llm_output("critic", result)
+            try:
+                critique = require_json(result)
+            except ValueError:
+                self.logger.error("critic invalid json: %s", _truncate(result, 1000))
+                raise
+            self._rounds += 1
+            await self.send("critique", to_json_text(critique), metadata=critique, in_reply_to=message.id)
+            if critique.get("status") == "needs_more":
+                for req in critique.get("requests", []):
+                    await self.send("info_request", to_json_text(req), in_reply_to=message.id)
 
 
 class WriterAgent(BaseAgent):
@@ -210,17 +254,19 @@ class WriterAgent(BaseAgent):
 
     async def handle_summary(self, message: Message) -> None:
         self.logger.info("recv summary from=%s", message.sender)
-        self._latest_summary = message.content
+        with self._span("agent.writer.handle_summary", message):
+            self._latest_summary = message.content
 
     async def handle_critique(self, message: Message) -> None:
         self.logger.info("recv critique from=%s", message.sender)
-        critique = require_json(message.content)
-        if critique.get("status") != "ok":
-            return
-        summary = self._latest_summary or message.content
-        result = await self.llm.complete(WRITER_SYSTEM, summary)
-        self._log_llm_output("writer", result)
-        await self.send("final_answer", result, in_reply_to=message.id)
+        with self._span("agent.writer.handle_critique", message):
+            critique = require_json(message.content)
+            if critique.get("status") != "ok":
+                return
+            summary = self._latest_summary or message.content
+            result = await self.llm.complete(WRITER_SYSTEM, summary)
+            self._log_llm_output("writer", result)
+            await self.send("final_answer", result, in_reply_to=message.id)
 
 
 def _format_results(results: List[SearchResult]) -> str:

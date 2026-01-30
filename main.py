@@ -13,6 +13,7 @@ from search_providers import (
 )
 from sk_client import SKClient, config_from_env
 from dotenv import load_dotenv
+from otel_setup import init_tracing
 
 
 def build_provider(mode: str, docs_root: str, brave_key: str | None):
@@ -33,6 +34,7 @@ async def run() -> None:
     args = parser.parse_args()
 
     load_dotenv()
+    init_tracing()
 
     logging.basicConfig(
         level=args.log_level.upper(),

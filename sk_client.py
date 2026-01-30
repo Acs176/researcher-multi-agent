@@ -4,6 +4,7 @@ import os
 import logging
 from dataclasses import dataclass
 from typing import Optional
+from opentelemetry import trace
 from semantic_kernel.kernel import KernelArguments
 
 try:
@@ -64,20 +65,36 @@ class SKClient:
         if response_format:
             settings.response_format = response_format
         prompt = system_prompt + "\n\nUser:\n{{$input}}"
-        self._logger.debug("llm request model=%s response_format=%s", self._config.model, response_format)
-        self._logger.debug("llm system_prompt=%s", _truncate(system_prompt, 2000))
-        self._logger.debug("llm user_prompt=%s", _truncate(user_prompt, 2000))
-        self._logger.debug("llm prompt_template=%s", _truncate(prompt, 2000))
-        function = self._build_function(prompt, settings)
-        result = await self._invoke(function, user_prompt)
-        text = self._extract_text(result)
-        if not text:
-            self._logger.error(
-                "Empty LLM output. result_type=%s repr=%s",
-                type(result).__name__,
-                repr(result),
-            )
-        return text
+        tracer = trace.get_tracer(__name__)
+        with tracer.start_as_current_span("llm.complete") as span:
+            preview_limit = _preview_limit()
+            if preview_limit:
+                input_preview = _truncate(
+                    f"{system_prompt}\n\nUser:\n{user_prompt}",
+                    preview_limit,
+                )
+                span.set_attribute("llm.input_preview", input_preview)
+            span.set_attribute("llm.model", self._config.model)
+            span.set_attribute("llm.service_id", self._config.service_id)
+            span.set_attribute("llm.system_prompt.length", len(system_prompt))
+            span.set_attribute("llm.user_prompt.length", len(user_prompt))
+            span.set_attribute("llm.max_completion_tokens", settings.max_completion_tokens)
+            span.set_attribute("llm.response_format", bool(response_format))
+            self._logger.debug("llm request model=%s response_format=%s", self._config.model, response_format)
+            self._logger.debug("llm system_prompt=%s", _truncate(system_prompt, 2000))
+            self._logger.debug("llm user_prompt=%s", _truncate(user_prompt, 2000))
+            self._logger.debug("llm prompt_template=%s", _truncate(prompt, 2000))
+            function = self._build_function(prompt, settings)
+            result = await self._invoke(function, user_prompt)
+            text = self._extract_text(result)
+            span.set_attribute("llm.response_length", len(text))
+            if not text:
+                self._logger.error(
+                    "Empty LLM output. result_type=%s repr=%s",
+                    type(result).__name__,
+                    repr(result),
+                )
+            return text
 
     def _build_function(self, prompt: str, settings):
         if hasattr(self.kernel, "create_function_from_prompt"):
@@ -152,3 +169,13 @@ def _truncate(text: str, limit: int) -> str:
     if len(text) <= limit:
         return text
     return text[:limit] + "..."
+
+
+def _preview_limit() -> int:
+    raw_limit = os.getenv("OTEL_LLM_PROMPT_PREVIEW_LIMIT", "512").strip()
+    if not raw_limit:
+        return 0
+    try:
+        return max(0, int(raw_limit))
+    except ValueError:
+        return 512
