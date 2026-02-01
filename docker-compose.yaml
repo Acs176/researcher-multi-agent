@@ -9,12 +9,27 @@ services:
       - ./observability/otel-collector.yaml:/config/otel-collector.yaml
     command:
       - --config=/config/otel-collector.yaml
+  jaeger-init:
+    image: busybox
+    user: "0"
+    volumes:
+      - jaeger-data:/badger
+    command: sh -c "mkdir -p /badger/key /badger/data && chown -R 10001:10001 /badger"
 
   jaeger:
-    container_name: jaeger
     image: jaegertracing/all-in-one:latest
+    depends_on:
+      jaeger-init:
+        condition: service_completed_successfully
+    user: "10001"
+    volumes:
+      - jaeger-data:/badger
     environment:
-      - COLLECTOR_OTLP_ENABLED=true
+      - SPAN_STORAGE_TYPE=badger
+    command:
+      - --badger.ephemeral=false
+      - --badger.directory-value=/badger/data
+      - --badger.directory-key=/badger/key
     ports:
       - "16686:16686" ## Jaeger UI
 
@@ -31,3 +46,4 @@ services:
 
 volumes:
   grafana-data:
+  jaeger-data:

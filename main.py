@@ -5,13 +5,16 @@ import asyncio
 import logging
 import os
 
-from orchestrator import ResearchCoordinator
+from semantic_kernel.agents import SequentialOrchestration
+from semantic_kernel.agents.runtime import InProcessRuntime
+from semantic_kernel.contents.chat_message_content import ChatMessageContent
+
+from agents import build_agents, build_kernel
 from search_providers import (
     LocalDocSearchProvider,
     NoopSearchProvider,
     SemanticKernelBraveSearchProvider,
 )
-from sk_client import SKClient, config_from_env
 from dotenv import load_dotenv
 from otel_setup import init_tracing
 
@@ -31,6 +34,7 @@ async def run() -> None:
     parser.add_argument("--search", default="local", choices=["local", "none", "brave"])
     parser.add_argument("--timeout", type=float, default=120.0)
     parser.add_argument("--log-level", default=os.getenv("LOG_LEVEL", "INFO"))
+    parser.add_argument("--show-steps", action="store_true", help="Print agent outputs as they complete")
     args = parser.parse_args()
 
     load_dotenv()
@@ -46,10 +50,34 @@ async def run() -> None:
         query = input("Research question: ").strip()
     brave_api_key = os.getenv("BRAVE_API_KEY")
     provider = build_provider(args.search, args.docs_root, brave_api_key)
-    llm = SKClient(config_from_env())
-    coordinator = ResearchCoordinator(llm=llm, search_provider=provider)
-    answer = await coordinator.run(query, timeout=args.timeout)
-    print(answer)
+    kernel = build_kernel()
+    members = build_agents(kernel, provider)
+
+    async def _agent_response_callback(message):
+        if not args.show_steps:
+            return
+        print("\n--- Agent Output ---")
+        print(_extract_text(message))
+
+    orchestration = SequentialOrchestration(
+        members=members,
+        agent_response_callback=_agent_response_callback if args.show_steps else None,
+    )
+    runtime = InProcessRuntime()
+    runtime.start()
+    result = await orchestration.invoke(task=query, runtime=runtime)
+    final = await result.get(timeout=args.timeout)
+    await runtime.stop_when_idle()
+    print(_extract_text(final))
+
+
+def _extract_text(message) -> str:
+    if isinstance(message, list):
+        parts = [_extract_text(item) for item in message]
+        return "\n".join([part for part in parts if part])
+    if isinstance(message, ChatMessageContent):
+        return message.content or ""
+    return str(message)
 
 
 if __name__ == "__main__":

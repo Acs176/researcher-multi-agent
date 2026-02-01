@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import html
 import logging
 import os
 import random
+import re
 import time
 from dataclasses import dataclass
 from typing import Iterable, List, Optional, Any
@@ -189,5 +191,15 @@ def _normalize_text_result(result) -> SearchResult:
         name = getattr(result, "name", None) or getattr(result, "title", None)
         value = getattr(result, "value", None) or getattr(result, "snippet", None) or ""
         link = getattr(result, "link", None) or getattr(result, "url", None) or ""
+    value = _clean_snippet(value)
     title = name or (value[:60] + "...") if value else (link or "Result")
     return SearchResult(title=title, snippet=value or "", url=link or "")
+
+
+_TAG_RE = re.compile(r"<[^>]+>")
+
+
+def _clean_snippet(text: str) -> str:
+    if not text:
+        return ""
+    return _TAG_RE.sub("", html.unescape(text)).strip()

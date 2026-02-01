@@ -1,15 +1,12 @@
 # Researcher Multi-Agent (Semantic Kernel + Python)
 
-Decentralized, message-passing team of AI agents that collaboratively answer complex research questions.
+Two-agent, sequential flow built on Semantic Kernel's agent orchestration.
 
 ## Architecture
-- Planner: breaks the user query into sub-tasks and proposes search queries.
-- Search: runs local doc search (RAG-style) and returns raw snippets.
-- Summarizer: condenses raw snippets into cited bullets.
-- Critic/Verifier: checks gaps/contradictions and requests more info if needed.
-- Writer: produces the final response using the verified summary.
+- Planner: decides if clarification is needed and proposes search queries.
+- Searcher: runs searches and returns structured results.
 
-Coordination is decentralized: agents subscribe to message types on a shared bus and publish follow-up messages.
+Coordination uses Semantic Kernel's sequential orchestration (actor model), not a custom bus.
 
 ## Setup
 ```
@@ -25,7 +22,7 @@ python main.py "What are the latest trends in retrieval-augmented generation?"
 
 Optional args:
 ```
-python main.py "..." --docs-root . --search local --timeout 120
+python main.py "..." --docs-root . --search local --timeout 120 --show-steps
 ```
 
 Logging:
@@ -33,10 +30,12 @@ Logging:
 python main.py "..." --log-level DEBUG
 ```
 
-Tuning (env vars):
-- `SK_MAX_TOKENS` (default: 900)
-- `SK_MAX_COMPLETION_TOKENS` (optional override)
-- `SK_REASONING_EFFORT` (recommended for gpt-5: `low`)
+Azure OpenAI (optional):
+```
+export AZURE_OPENAI_ENDPOINT="https://...openai.azure.com/"
+export AZURE_OPENAI_API_KEY="..."
+export AZURE_OPENAI_DEPLOYMENT="my-deployment"
+```
 
 Brave web search (Semantic Kernel connector):
 ```
@@ -46,5 +45,5 @@ python main.py "..." --search brave
 
 ## Notes
 - Search is local-only (simple file scan) by default. Use the Brave connector for web search.
-- `info_request` messages are only routed to Search when `intent="search"` to avoid accidental web queries.
+- `--show-steps` prints each agent output as it completes.
 - All agent prompts live in `prompts.py`.
