@@ -72,7 +72,7 @@ class SemanticKernelBraveSearchProvider(SearchProvider):
     def __init__(
         self,
         api_key: Optional[str] = None,
-        min_interval: float = 0.9,
+        min_interval: float = 1.1, # brave free, limited at 1 call / sec
         max_retries: int = 2,
         backoff_base: float = 1.0,
     ) -> None:
@@ -92,7 +92,7 @@ class SemanticKernelBraveSearchProvider(SearchProvider):
         self._last_request_at = 0.0
         self._logger = logging.getLogger("search.brave")
 
-    async def search(self, query: str, limit: int = 5) -> List[SearchResult]:
+    async def search(self, query: str, limit: int = 2) -> List[SearchResult]:
         if not query:
             return []
         results = await self._run_search(query=query, limit=limit)
@@ -105,17 +105,23 @@ class SemanticKernelBraveSearchProvider(SearchProvider):
             try:
                 return await self._call_search(query=query, limit=limit)
             except Exception as exc:  # pragma: no cover - runtime dependency
-                if _is_rate_limit_error(exc) and attempts < self._max_retries:
-                    delay = self._backoff_base * (2**attempts) + random.uniform(0, 0.25)
+                if _is_rate_limit_error(exc):
+                    if attempts < self._max_retries:
+                        delay = self._backoff_base * (2**attempts) + random.uniform(0, 0.25)
+                        self._logger.warning(
+                            "Brave rate limited (429). Retrying in %.2fs (attempt %s/%s).",
+                            delay,
+                            attempts + 1,
+                            self._max_retries,
+                        )
+                        await asyncio.sleep(delay)
+                        attempts += 1
+                        continue
                     self._logger.warning(
-                        "Brave rate limited (429). Retrying in %.2fs (attempt %s/%s).",
-                        delay,
+                        "Brave rate limited (429). Giving up after %s attempts.",
                         attempts + 1,
-                        self._max_retries,
                     )
-                    await asyncio.sleep(delay)
-                    attempts += 1
-                    continue
+                    return []
                 self._logger.warning(
                     "Brave search failed for query=%s error=%s", query, exc, exc_info=True
                 )
@@ -151,7 +157,17 @@ def _is_rate_limit_error(exc: Exception) -> bool:
     status = getattr(response, "status_code", None) if response is not None else None
     if status == 429:
         return True
+    if response is not None:
+        status = getattr(response, "status", None)
+        if status == 429:
+            return True
     status = getattr(exc, "status_code", None)
+    if status == 429:
+        return True
+    status = getattr(exc, "status", None)
+    if status == 429:
+        return True
+    status = getattr(exc, "code", None)
     if status == 429:
         return True
     message = str(exc)

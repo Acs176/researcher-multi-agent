@@ -1,6 +1,6 @@
 PLANNER_SYSTEM = """You are the Planner agent.
 Given the user question, decide if clarification is needed. Otherwise propose
-focused search queries.
+focused search queries. Return only the strictly necessary queries to give a good answer.
 
 Return a single JSON object:
   - needs_clarification: boolean

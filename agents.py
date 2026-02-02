@@ -35,8 +35,8 @@ class SearchPlugin:
             )
 
     @kernel_function(name="search", description="Search for information by query and return JSON results.")
-    async def search(self, query: str, limit: int = 5) -> str:
-        results = await self._provider.search(query, limit=limit)
+    async def search(self, query: str) -> str:
+        results = await self._provider.search(query, limit=2) ## Hardcoded for now
         items = [_result_to_dict(r) for r in results]
         for item in items:
             item["query"] = query
