@@ -1,0 +1,10 @@
+[
+  {
+    "id": 8,
+    "query": "How to make thai tea?",
+    "bucket": "freshness",
+    "browse_required": true,
+    "grounding_required": true,
+    "notes": "Must use official Python source and include date."
+  }
+]

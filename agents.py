@@ -4,19 +4,22 @@ import json
 import os
 from typing import Any, Dict, List, Optional
 
+from eval_logging import RunLogger
+
 from semantic_kernel import Kernel
 from semantic_kernel.agents import ChatCompletionAgent
 from semantic_kernel.connectors.ai.open_ai import AzureChatCompletion, OpenAIChatCompletion
 from semantic_kernel.functions import kernel_function
 
 from polite_fetcher import FetchResult, PoliteFetcher
-from prompts import PLANNER_SYSTEM, SEARCHER_SYSTEM
+from prompts import SINGLE_AGENT_SYSTEM
 from search_providers import SearchProvider, SearchResult
 
 
 class SearchPlugin:
-    def __init__(self, provider: SearchProvider) -> None:
+    def __init__(self, provider: SearchProvider, run_logger: Optional["RunLogger"] = None) -> None:
         self._provider = provider
+        self._run_logger = run_logger
         self._fetcher: Optional[PoliteFetcher] = None
         if _env_flag("SEARCH_FETCH_PAGES", default=False):
             self._fetcher = PoliteFetcher(
@@ -45,29 +48,43 @@ class SearchPlugin:
             urls = [r.url for r in results if _should_fetch_url(r.url)]
             fetched = await self._fetcher.fetch_many(urls)
             _apply_fetch_results(payload["results"], fetched)
+        if self._run_logger:
+            self._run_logger.record_search(query, payload["results"])
         return json.dumps(payload, ensure_ascii=True)
 
 
-def build_kernel() -> Kernel:
+def build_kernel(disable_streaming: bool = False) -> Kernel:
     kernel = Kernel()
     service = _build_chat_service()
+    if disable_streaming:
+        _disable_streaming_on_service(service)
     kernel.add_service(service)
     return kernel
 
 
-def build_agents(kernel: Kernel, provider: SearchProvider) -> List[ChatCompletionAgent]:
-    planner = ChatCompletionAgent(
-        name="Planner",
-        instructions=PLANNER_SYSTEM,
-        kernel=kernel,
-    )
-    searcher = ChatCompletionAgent(
-        name="Search",
-        instructions=SEARCHER_SYSTEM,
-        kernel=kernel,
-        plugins=[SearchPlugin(provider)],
-    )
-    return [planner, searcher]
+def build_agents(
+    kernel: Kernel,
+    provider: SearchProvider,
+    run_logger: Optional["RunLogger"] = None,
+    execution_settings: Any | None = None,
+    force_non_streaming: bool = False,
+) -> List[ChatCompletionAgent]:
+    researcher_kwargs = {
+        "name": "Researcher",
+        "instructions": SINGLE_AGENT_SYSTEM,
+        "kernel": kernel,
+        "plugins": [SearchPlugin(provider, run_logger=run_logger)],
+    }
+    if execution_settings is not None:
+        researcher_kwargs["execution_settings"] = execution_settings
+    try:
+        researcher = ChatCompletionAgent(**researcher_kwargs)
+    except TypeError:
+        researcher_kwargs.pop("execution_settings", None)
+        researcher = ChatCompletionAgent(**researcher_kwargs)
+    if force_non_streaming:
+        _disable_streaming_on_agent(researcher)
+    return [researcher]
 
 
 def _build_chat_service():
@@ -91,6 +108,24 @@ def _build_chat_service():
         api_key=api_key,
         org_id=org_id,
     )
+
+
+def _disable_streaming_on_service(service: Any) -> None:
+    for attr in ("use_streaming", "streaming", "stream"):
+        if hasattr(service, attr):
+            try:
+                setattr(service, attr, False)
+            except Exception:
+                continue
+
+
+def _disable_streaming_on_agent(agent: Any) -> None:
+    for attr in ("use_streaming", "streaming", "is_streaming", "stream"):
+        if hasattr(agent, attr):
+            try:
+                setattr(agent, attr, False)
+            except Exception:
+                continue
 
 
 def _result_to_dict(result: SearchResult) -> Dict[str, Any]:

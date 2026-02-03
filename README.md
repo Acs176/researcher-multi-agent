@@ -1,10 +1,9 @@
 # Researcher Multi-Agent (Semantic Kernel + Python)
 
-Two-agent, sequential flow built on Semantic Kernel's agent orchestration.
+Single-agent flow built on Semantic Kernel's agent orchestration.
 
 ## Architecture
-- Planner: decides if clarification is needed and proposes search queries.
-- Searcher: runs searches and returns structured results.
+- Researcher: decides when to search, calls the search tool, and returns a summarized answer.
 
 Coordination uses Semantic Kernel's sequential orchestration (actor model), not a custom bus.
 
@@ -28,6 +27,16 @@ python main.py "..." --docs-root . --search local --timeout 120 --show-steps
 Logging:
 ```
 python main.py "..." --log-level DEBUG
+```
+
+## Eval runner
+Run a queryset with LangGraph and persist per-query logs (JSONL):
+```
+python eval_runner.py --queryset eval/queryset.json --eval-id eval_001 --eval-log eval/eval_runs.jsonl
+```
+Common filters:
+```
+python eval_runner.py --bucket freshness --limit 5 --search brave
 ```
 
 Azure OpenAI (optional):

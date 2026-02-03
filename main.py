@@ -4,7 +4,6 @@ import argparse
 import asyncio
 import logging
 import os
-
 from semantic_kernel.agents import SequentialOrchestration
 from semantic_kernel.agents.runtime import InProcessRuntime
 from semantic_kernel.contents.chat_message_content import ChatMessageContent
@@ -54,21 +53,21 @@ async def run() -> None:
     members = build_agents(kernel, provider)
 
     async def _agent_response_callback(message):
-        if not args.show_steps:
-            return
-        print("\n--- Agent Output ---")
-        print(_extract_text(message))
+        if args.show_steps:
+            print("\n--- Agent Output ---")
+            print(_extract_text(message))
 
     orchestration = SequentialOrchestration(
         members=members,
-        agent_response_callback=_agent_response_callback if args.show_steps else None,
+        agent_response_callback=_agent_response_callback if (args.show_steps) else None,
     )
     runtime = InProcessRuntime()
     runtime.start()
     result = await orchestration.invoke(task=query, runtime=runtime)
     final = await result.get(timeout=args.timeout)
     await runtime.stop_when_idle()
-    print(_extract_text(final))
+    answer = _extract_text(final)
+    print(answer)
 
 
 def _extract_text(message) -> str:
