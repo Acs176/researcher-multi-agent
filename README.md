@@ -1,11 +1,13 @@
-# Researcher Multi-Agent (Semantic Kernel + Python)
+# Researcher Multi-Agent (LangGraph + Python)
 
-Single-agent flow built on Semantic Kernel's agent orchestration.
+Multi-agent flow built on LangGraph with a planner → searcher → fetcher → summarizer pipeline.
 
 ## Architecture
-- Researcher: decides when to search, calls the search tool, and returns a summarized answer.
-
-Coordination uses Semantic Kernel's sequential orchestration (actor model), not a custom bus.
+- Planner: decides whether to search and proposes queries.
+- Searcher: executes searches and returns results.
+- URL selector: picks the most relevant URLs to fetch.
+- Fetcher: retrieves content from selected URLs.
+- Summarizer: answers the question from fetched content (or falls back when none).
 
 ## Setup
 ```
@@ -21,7 +23,7 @@ python main.py "What are the latest trends in retrieval-augmented generation?"
 
 Optional args:
 ```
-python main.py "..." --docs-root . --search local --timeout 120 --show-steps
+python main.py "..." --search brave --timeout 120 --show-steps
 ```
 
 Logging:
@@ -46,13 +48,14 @@ export AZURE_OPENAI_API_KEY="..."
 export AZURE_OPENAI_DEPLOYMENT="my-deployment"
 ```
 
-Brave web search (Semantic Kernel connector):
+Brave web search (Brave Search API):
 ```
 export BRAVE_API_KEY="..."
 python main.py "..." --search brave
 ```
 
 ## Notes
-- Search is local-only (simple file scan) by default. Use the Brave connector for web search.
+- Search uses the Brave API when `--search brave` is selected.
 - `--show-steps` prints each agent output as it completes.
 - All agent prompts live in `prompts.py`.
+- The LangGraph pipeline lives in `langgraph_flow.py`.

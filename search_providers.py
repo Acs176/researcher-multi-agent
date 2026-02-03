@@ -3,12 +3,13 @@ from __future__ import annotations
 import asyncio
 import html
 import logging
-import os
 import random
 import re
 import time
 from dataclasses import dataclass
-from typing import Iterable, List, Optional, Any
+from typing import Any, List, Optional
+
+import httpx
 
 
 @dataclass
@@ -20,85 +21,47 @@ class SearchResult:
 
 class SearchProvider:
     async def search(self, query: str, limit: int = 5) -> List[SearchResult]:
+        """Search for a query and return normalized results."""
         raise NotImplementedError
-
-
-class LocalDocSearchProvider(SearchProvider):
-    """Naive local search across files for lightweight RAG over docs."""
-
-    def __init__(self, root: str, include_ext: Iterable[str] | None = None) -> None:
-        self.root = root
-        self.include_ext = set(include_ext or [".md", ".txt", ".rst"])
-
-    def _iter_files(self) -> Iterable[str]:
-        for dirpath, _, filenames in os.walk(self.root):
-            for name in filenames:
-                if os.path.splitext(name)[1].lower() in self.include_ext:
-                    yield os.path.join(dirpath, name)
-
-    async def search(self, query: str, limit: int = 5) -> List[SearchResult]:
-        results: List[SearchResult] = []
-        q = query.lower().strip()
-        if not q:
-            return results
-        for path in self._iter_files():
-            if len(results) >= limit:
-                break
-            try:
-                with open(path, "r", encoding="utf-8") as handle:
-                    for line in handle:
-                        if q in line.lower():
-                            results.append(
-                                SearchResult(
-                                    title=os.path.basename(path),
-                                    snippet=line.strip()[:280],
-                                    url=f"file://{path}",
-                                )
-                            )
-                            break
-            except OSError:
-                continue
-        return results
 
 
 class NoopSearchProvider(SearchProvider):
     async def search(self, query: str, limit: int = 5) -> List[SearchResult]:
+        """Return no results for any query."""
         return []
 
 
-class SemanticKernelBraveSearchProvider(SearchProvider):
-    """Web search provider backed by Semantic Kernel's BraveSearch connector."""
+class BraveSearchProvider(SearchProvider):
+    """Web search provider backed by the Brave Search API."""
 
     def __init__(
         self,
         api_key: Optional[str] = None,
-        min_interval: float = 1.1, # brave free, limited at 1 call / sec
+        min_interval: float = 1.1,  # brave free, limited at 1 call / sec
         max_retries: int = 2,
         backoff_base: float = 1.0,
+        timeout: float = 15.0,
+        endpoint: str = "https://api.search.brave.com/res/v1/web/search",
     ) -> None:
-        try:
-            from semantic_kernel.connectors.brave import BraveSearch
-            from semantic_kernel.data.text_search import TextSearchResult
-        except Exception as exc:  # pragma: no cover - runtime dependency
-            raise RuntimeError(
-                "Semantic Kernel BraveSearch connector is unavailable. "
-                "Ensure semantic-kernel is installed with the required extras."
-            ) from exc
-        self._text_search_result_type = TextSearchResult
-        self._client = BraveSearch(api_key=api_key) if api_key else BraveSearch()
+        if not api_key:
+            raise RuntimeError("BRAVE_API_KEY is required for Brave search.")
+        self._api_key = api_key
         self._min_interval = min_interval
         self._max_retries = max_retries
         self._backoff_base = backoff_base
+        self._timeout = timeout
+        self._endpoint = endpoint
         self._last_request_at = 0.0
         self._logger = logging.getLogger("search.brave")
 
     async def search(self, query: str, limit: int = 2) -> List[SearchResult]:
+        """Search Brave and return normalized results."""
         if not query:
             return []
-        results = await self._run_search(query=query, limit=limit)
-        return await _to_search_results(results)
+        return await self._run_search(query=query, limit=limit)
 
-    async def _run_search(self, query: str, limit: int):
+    async def _run_search(self, query: str, limit: int) -> List[SearchResult]:
+        """Execute Brave search with retry/backoff."""
         attempts = 0
         while True:
             await self._throttle()
@@ -127,21 +90,37 @@ class SemanticKernelBraveSearchProvider(SearchProvider):
                 )
                 return []
 
-    async def _call_search(self, query: str, limit: int):
-        if hasattr(self._client, "search"):
-            try:
-                return await self._client.search(
-                    query=query,
-                    output_type=self._text_search_result_type,
-                    top=limit,
-                )
-            except TypeError:
-                return await self._client.search(query=query, top=limit)
-        if hasattr(self._client, "get_text_search_results"):
-            return await self._client.get_text_search_results(query=query, top=limit)
-        raise RuntimeError("BraveSearch client has no supported search method.")
+    async def _call_search(self, query: str, limit: int) -> List[SearchResult]:
+        """Call the Brave Search API and parse results."""
+        headers = {
+            "Accept": "application/json",
+            "X-Subscription-Token": self._api_key,
+        }
+        params = {"q": query, "count": str(limit)}
+        async with httpx.AsyncClient(timeout=self._timeout) as client:
+            resp = await client.get(self._endpoint, params=params, headers=headers)
+        if resp.status_code == 429:
+            raise httpx.HTTPStatusError(
+                "Brave Search rate limited",
+                request=resp.request,
+                response=resp,
+            )
+        if resp.status_code >= 400:
+            self._logger.warning(
+                "Brave search failed status=%s body=%s",
+                resp.status_code,
+                (resp.text or "")[:200],
+            )
+            return []
+        try:
+            data = resp.json()
+        except ValueError:
+            self._logger.warning("Brave search returned invalid JSON.")
+            return []
+        return _parse_brave_results(data, limit=limit)
 
     async def _throttle(self) -> None:
+        """Throttle requests to respect the minimum interval."""
         if self._min_interval <= 0:
             return
         now = time.monotonic()
@@ -153,69 +132,47 @@ class SemanticKernelBraveSearchProvider(SearchProvider):
 
 
 def _is_rate_limit_error(exc: Exception) -> bool:
+    """Return True if an exception indicates rate limiting."""
     response = getattr(exc, "response", None)
     status = getattr(response, "status_code", None) if response is not None else None
-    if status == 429:
-        return True
-    if response is not None:
-        status = getattr(response, "status", None)
-        if status == 429:
-            return True
+    if status is not None:
+        return status == 429
     status = getattr(exc, "status_code", None)
-    if status == 429:
-        return True
-    status = getattr(exc, "status", None)
-    if status == 429:
-        return True
-    status = getattr(exc, "code", None)
-    if status == 429:
-        return True
-    message = str(exc)
-    return "429" in message or "Too Many Requests" in message
+    return status == 429
 
 
-async def _to_search_results(kernel_results) -> List[SearchResult]:
+def _parse_brave_results(data: Any, limit: int) -> List[SearchResult]:
+    """Parse Brave API JSON into SearchResult objects."""
     items: List[SearchResult] = []
-    if kernel_results is None:
+    web = data.get("web") if isinstance(data, dict) else None
+    results = web.get("results") if isinstance(web, dict) else None
+    if not isinstance(results, list):
         return items
-    results_iter = _extract_iterable_results(kernel_results)
-    if hasattr(results_iter, "__aiter__"):
-        async for result in results_iter:
-            items.append(_normalize_text_result(result))
-    else:
-        for result in results_iter:
-            items.append(_normalize_text_result(result))
+    for result in results:
+        if not isinstance(result, dict):
+            continue
+        url = result.get("url") or result.get("link") or ""
+        title = result.get("title") or ""
+        snippet = result.get("description") or result.get("snippet") or ""
+        if not url:
+            continue
+        items.append(
+            SearchResult(
+                title=title or (url[:60] + "..." if len(url) > 60 else url),
+                snippet=_clean_snippet(snippet),
+                url=url,
+            )
+        )
+        if len(items) >= limit:
+            break
     return items
-
-
-def _extract_iterable_results(kernel_results: Any):
-    if hasattr(kernel_results, "results"):
-        return getattr(kernel_results, "results")
-    if isinstance(kernel_results, list):
-        return kernel_results
-    if hasattr(kernel_results, "__iter__"):
-        return kernel_results
-    return []
-
-
-def _normalize_text_result(result) -> SearchResult:
-    if isinstance(result, dict):
-        name = result.get("name") or result.get("title")
-        value = result.get("value") or result.get("snippet") or ""
-        link = result.get("link") or result.get("url") or ""
-    else:
-        name = getattr(result, "name", None) or getattr(result, "title", None)
-        value = getattr(result, "value", None) or getattr(result, "snippet", None) or ""
-        link = getattr(result, "link", None) or getattr(result, "url", None) or ""
-    value = _clean_snippet(value)
-    title = name or (value[:60] + "...") if value else (link or "Result")
-    return SearchResult(title=title, snippet=value or "", url=link or "")
 
 
 _TAG_RE = re.compile(r"<[^>]+>")
 
 
 def _clean_snippet(text: str) -> str:
+    """Strip HTML tags and entities from snippets."""
     if not text:
         return ""
     return _TAG_RE.sub("", html.unescape(text)).strip()

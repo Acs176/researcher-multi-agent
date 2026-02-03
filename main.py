@@ -2,35 +2,31 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import logging
 import os
-from semantic_kernel.agents import SequentialOrchestration
-from semantic_kernel.agents.runtime import InProcessRuntime
-from semantic_kernel.contents.chat_message_content import ChatMessageContent
 
-from agents import build_agents, build_kernel
-from search_providers import (
-    LocalDocSearchProvider,
-    NoopSearchProvider,
-    SemanticKernelBraveSearchProvider,
-)
 from dotenv import load_dotenv
+
+from agents import SearchPlugin
+from eval_logging import RunLogger
+from langgraph_flow import build_graph, build_openai_client
 from otel_setup import init_tracing
+from search_providers import BraveSearchProvider, NoopSearchProvider
 
 
-def build_provider(mode: str, docs_root: str, brave_key: str | None):
-    if mode == "local":
-        return LocalDocSearchProvider(docs_root)
+def _build_provider(mode: str, brave_key: str | None):
+    """Construct the CLI search provider."""
     if mode == "brave":
-        return SemanticKernelBraveSearchProvider(api_key=brave_key)
+        return BraveSearchProvider(api_key=brave_key)
     return NoopSearchProvider()
 
 
 async def run() -> None:
-    parser = argparse.ArgumentParser(description="Multi-agent research coordinator")
+    """CLI entrypoint for a single LangGraph query."""
+    parser = argparse.ArgumentParser(description="LangGraph multi-agent research coordinator")
     parser.add_argument("query", nargs="*", help="Research question")
-    parser.add_argument("--docs-root", default=os.getcwd(), help="Root for local doc search")
-    parser.add_argument("--search", default="local", choices=["local", "none", "brave"])
+    parser.add_argument("--search", default="brave", choices=["none", "brave"])
     parser.add_argument("--timeout", type=float, default=120.0)
     parser.add_argument("--log-level", default=os.getenv("LOG_LEVEL", "INFO"))
     parser.add_argument("--show-steps", action="store_true", help="Print agent outputs as they complete")
@@ -47,36 +43,38 @@ async def run() -> None:
     query = " ".join(args.query).strip()
     if not query:
         query = input("Research question: ").strip()
+
     brave_api_key = os.getenv("BRAVE_API_KEY")
-    provider = build_provider(args.search, args.docs_root, brave_api_key)
-    kernel = build_kernel()
-    members = build_agents(kernel, provider)
+    provider = _build_provider(args.search, brave_api_key)
+    client, model = build_openai_client()
 
-    async def _agent_response_callback(message):
-        if args.show_steps:
-            print("\n--- Agent Output ---")
-            print(_extract_text(message))
+    run_logger = RunLogger(eval_id="cli", log_path="eval/eval_runs.jsonl")
+    run_logger.record_query(query)
+    search_plugin = SearchPlugin(provider, run_logger=run_logger)
 
-    orchestration = SequentialOrchestration(
-        members=members,
-        agent_response_callback=_agent_response_callback if (args.show_steps) else None,
+    app = build_graph(
+        client=client,
+        model=model,
+        search_plugin=search_plugin,
+        run_logger=run_logger,
+        timeout=args.timeout,
+        show_steps=args.show_steps,
     )
-    runtime = InProcessRuntime()
-    runtime.start()
-    result = await orchestration.invoke(task=query, runtime=runtime)
-    final = await result.get(timeout=args.timeout)
-    await runtime.stop_when_idle()
-    answer = _extract_text(final)
+
+    result = await app.ainvoke(
+        {
+            "query": query,
+            "plan": {},
+            "search_results": [],
+            "urls": [],
+            "fetched": [],
+            "answer": "",
+        }
+    )
+    answer = (result.get("answer") or "").strip()
+    if not answer:
+        answer = json.dumps(result.get("fetched", []), ensure_ascii=True)
     print(answer)
-
-
-def _extract_text(message) -> str:
-    if isinstance(message, list):
-        parts = [_extract_text(item) for item in message]
-        return "\n".join([part for part in parts if part])
-    if isinstance(message, ChatMessageContent):
-        return message.content or ""
-    return str(message)
 
 
 if __name__ == "__main__":
