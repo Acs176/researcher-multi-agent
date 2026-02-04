@@ -3,9 +3,10 @@ from __future__ import annotations
 import json
 import os
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlparse
 
 from eval_logging import RunLogger
-from polite_fetcher import FetchResult, PoliteFetcher
+from polite_fetcher import FetchResult, PoliteFetcher, RobotsDenyCache
 from search_providers import SearchProvider, SearchResult
 
 
@@ -16,6 +17,8 @@ class SearchPlugin:
         """Initialize with a provider and optional run logger."""
         self._provider = provider
         self._run_logger = run_logger
+        self._deny_cache = _build_deny_cache()
+        self._search_limit = _env_int("SEARCH_RESULTS_LIMIT", 8)
         self._fetcher: Optional[PoliteFetcher] = None
         if _env_flag("SEARCH_FETCH_PAGES", default=False):
             self._fetcher = PoliteFetcher(
@@ -31,18 +34,22 @@ class SearchPlugin:
                 robots_ttl_seconds=_env_int("SEARCH_FETCH_ROBOTS_TTL", 86_400),
                 trace_content=_env_flag("SEARCH_FETCH_TRACE_CONTENT", default=True),
                 trace_content_max_chars=_env_int("SEARCH_FETCH_TRACE_MAX_CHARS", 0),
+                robots_deny_cache=self._deny_cache,
             )
 
     async def search(self, query: str) -> str:
         """Search for a query and return a JSON payload string."""
-        results = await self._provider.search(query, limit=2)  # Hardcoded for now
+        results = await self._provider.search(query, limit=self._search_limit)
+        if self._deny_cache:
+            results = await _filter_denied_results(results, self._deny_cache)
         items = [_result_to_dict(r) for r in results]
         for item in items:
             item["query"] = query
         payload: Dict[str, Any] = {"query": query, "results": items}
         if self._fetcher:
             urls = [r.url for r in results if _should_fetch_url(r.url)]
-            fetched = await self._fetcher.fetch_many(urls)
+            allowed_urls = await self._fetcher.filter_allowed(urls)
+            fetched = await self._fetcher.fetch_many(allowed_urls)
             _apply_fetch_results(payload["results"], fetched)
         if self._run_logger:
             self._run_logger.record_search(query, payload["results"])
@@ -73,6 +80,52 @@ def _apply_fetch_results(results: List[Dict[str, Any]], fetched: Dict[str, Fetch
 def _should_fetch_url(url: str) -> bool:
     """Return True for http(s) URLs eligible for fetching."""
     return url.startswith("http://") or url.startswith("https://")
+
+
+def _build_deny_cache() -> Optional[RobotsDenyCache]:
+    """Create a deny cache from environment configuration, if enabled."""
+    redis_url = os.getenv("SEARCH_FETCH_ROBOTS_DENY_REDIS_URL")
+    if not redis_url:
+        return None
+    ttl = _env_int(
+        "SEARCH_FETCH_ROBOTS_DENY_TTL",
+        _env_int("SEARCH_FETCH_ROBOTS_TTL", 86_400),
+    )
+    prefix = os.getenv("SEARCH_FETCH_ROBOTS_DENY_REDIS_PREFIX", "robots:deny")
+    return RobotsDenyCache(redis_url=redis_url, ttl_seconds=ttl, key_prefix=prefix)
+
+
+async def _filter_denied_results(
+    results: List[SearchResult],
+    deny_cache: RobotsDenyCache,
+) -> List[SearchResult]:
+    """Filter out results whose domains are in the deny cache."""
+    domains: Dict[tuple[str, str], None] = {}
+    for result in results:
+        key = _domain_key(result.url)
+        if key:
+            domains[key] = None
+    denied: set[tuple[str, str]] = set()
+    for scheme, netloc in domains:
+        if await deny_cache.is_denied(scheme, netloc):
+            denied.add((scheme, netloc))
+    if not denied:
+        return results
+    filtered: List[SearchResult] = []
+    for result in results:
+        key = _domain_key(result.url)
+        if key and key in denied:
+            continue
+        filtered.append(result)
+    return filtered
+
+
+def _domain_key(url: str) -> Optional[tuple[str, str]]:
+    """Return a scheme/netloc key for a URL if possible."""
+    parsed = urlparse(url)
+    if parsed.scheme in {"http", "https"} and parsed.netloc:
+        return (parsed.scheme, parsed.netloc)
+    return None
 
 
 def _env_flag(name: str, default: bool) -> bool:

@@ -8,7 +8,7 @@ import os
 
 from dotenv import load_dotenv
 
-from agents import SearchPlugin
+from search_plugin import SearchPlugin
 from eval_logging import RunLogger
 from langgraph_flow import build_graph, build_openai_client
 from otel_setup import init_tracing
@@ -74,7 +74,8 @@ async def run() -> None:
     answer = (result.get("answer") or "").strip()
     if not answer:
         answer = json.dumps(result.get("fetched", []), ensure_ascii=True)
-    print(answer)
+    if not args.show_steps:
+        print(answer)
 
 
 if __name__ == "__main__":

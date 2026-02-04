@@ -14,7 +14,7 @@ from typing import Any, Dict, List, Optional, Sequence
 
 from dotenv import load_dotenv
 
-from agents import SearchPlugin
+from search_plugin import SearchPlugin
 from eval_logging import RunLogger
 from langgraph_flow import build_graph, build_openai_client
 from otel_setup import init_tracing

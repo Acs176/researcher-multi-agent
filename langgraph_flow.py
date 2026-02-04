@@ -138,6 +138,9 @@ def build_graph(
             timeout=timeout,
             run_logger=run_logger,
         )
+        if show_steps:
+            print("\n--- URL picker Output ---")
+            print(json.dumps(selection.urls, ensure_ascii=True))
         return {"urls": selection.urls, "plan": selection.model_dump()}
 
     async def fetch_node(state: AgentState) -> Dict[str, Any]:
